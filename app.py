@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -19,6 +20,9 @@ from pypdf import PdfReader
 # Config
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL = "gemini-3.5-flash"
+FALLBACK_MODELS = ["gemini-3.5-flash-lite"]  # tried if the main model stays overloaded
+RETRIES_PER_MODEL = 3  # attempts per model, with exponential backoff
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
 MAX_FILE_MB = 5
 MAX_CHARS = 30_000  # keeps the prompt small and fast
 MIN_CHARS = 150  # below this we assume the PDF is a scanned image
@@ -189,6 +193,33 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def _is_retryable(err: Exception) -> bool:
+    code = getattr(err, "code", None)
+    if isinstance(code, int):
+        return code in RETRYABLE_CODES
+    msg = str(err)
+    return any(tok in msg for tok in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded"))
+
+
+def _generate_with_retry(client, models, prompt, config, sleep=time.sleep):
+    """Try each model in order; retry transient errors with exponential backoff."""
+    last_err = None
+    for model in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return client.models.generate_content(
+                    model=model, contents=prompt, config=config
+                )
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if not _is_retryable(e):
+                    raise
+                if attempt < RETRIES_PER_MODEL - 1:
+                    sleep(2 ** attempt * 2)  # 2s, 4s
+        # all attempts for this model failed -> fall through to next model
+    raise last_err
+
+
 def analyze_resume(api_key: str, model: str, resume_text: str, job_desc: str) -> dict:
     client = genai.Client(api_key=api_key)
     prompt = f"RESUME:\n\"\"\"\n{resume_text[:MAX_CHARS]}\n\"\"\"\n"
@@ -202,9 +233,8 @@ def analyze_resume(api_key: str, model: str, resume_text: str, job_desc: str) ->
         response_mime_type="application/json",
         temperature=0.2,
     )
-    response = client.models.generate_content(
-        model=model, contents=prompt, config=config
-    )
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = _generate_with_retry(client, models, prompt, config)
     return normalize_result(parse_json_response(response.text))
 
 
@@ -344,7 +374,14 @@ def main() -> None:
             st.error("The AI returned an unreadable response. Please try again.")
             st.stop()
         except Exception as e:
-            st.error(f"Analysis failed: {e}")
+            if _is_retryable(e):
+                st.error(
+                    "Google's Gemini service is overloaded right now (tried several "
+                    "times and a backup model). Please wait a minute and click "
+                    "Analyze again."
+                )
+            else:
+                st.error(f"Analysis failed: {e}")
             st.stop()
 
         st.session_state["result"] = result
