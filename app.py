@@ -18,7 +18,7 @@ from pypdf import PdfReader
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
 MAX_FILE_MB = 5
 MAX_CHARS = 30_000  # keeps the prompt small and fast
 MIN_CHARS = 150  # below this we assume the PDF is a scanned image
